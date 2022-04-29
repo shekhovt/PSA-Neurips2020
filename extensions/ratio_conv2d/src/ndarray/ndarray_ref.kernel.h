@@ -1,0 +1,537 @@
+#pragma once
+
+/*!
+ This header defines ndarray_ref, a versatile placeholder to pass arrays around, with light dependencies
+ - can be passed into cuda kernels
+ - supports various padding (alignment)
+ - operations are available through ndarray_op.h | ndarray_op.cu
+ - memory allocation functionality is available through ndarray_mem.h | ndarray_mem.cpp
+ */
+
+#include <assert.h>
+#include "intn.h"
+#include "defines.h"
+
+namespace hd {
+
+template<typename type>
+__HOSTDEVICE__ void swap(type & a, type & b) {
+	const type c = a;
+	a = b;
+	b = c;
+}
+}
+
+//_______________________________tstride_____________________________________________
+//! tstride: safe pointer arithmetics with strides measured diffrently, e.g. in types or in bytes
+
+template<typename type> struct tstride {
+protected:
+	int type_stride;
+public:
+	__HOSTDEVICE__ tstride() {
+	}
+	//! default copy ctr
+	tstride(const tstride<type> & b) = default;
+	//! construct from int
+	__HOSTDEVICE__ tstride(int stride_in_types) :
+			type_stride(stride_in_types) {
+	}
+	//! default operator =
+	tstride<type> & operator =(const tstride<type> & b) = default;
+	//! assign from int
+	__HOSTDEVICE__ void operator =(int stride_in_types) {
+		type_stride = stride_in_types;
+	}
+	//! if you really need to know the stored value
+	__HOSTDEVICE__ int value() const {
+		return type_stride;
+	}
+public:
+	//arithmetics
+	//! unary -
+	__HOSTDEVICE__ tstride<type> operator -() const {
+		return tstride<type>(-type_stride);
+	}
+	//
+	__HOSTDEVICE__ tstride<type> & operator *=(int x) {
+		type_stride *= x;
+		return *this;
+	}
+
+	__HOSTDEVICE__ tstride<type> operator *(int x) const {
+		tstride<type> r = *this;
+		r *= x;
+		return r;
+	}
+
+	//
+	template<typename ptype>
+	__HOSTDEVICE__ ptype * __RESTRICT__ & step_pointer(ptype *& p) const {
+		return (ptype *&) ((char*&) p += type_stride * intsizeof(type));
+	}
+
+#ifdef __CUDACC__
+	template<typename ptype>
+	__HOSTDEVICE__ ptype * __RESTRICT__ & step_pointer(ptype * __RESTRICT__ & p) const {
+		return (ptype *&) ((char*&) p += type_stride * intsizeof(type));
+	}
+#endif
+
+	//
+	__HOSTDEVICE__ tstride<type> & operator +=(const tstride<type> & b) {
+		type_stride += b.value();
+		return *this;
+	}
+	//
+	__HOSTDEVICE__ tstride<type> & operator -=(const tstride<type> & b) {
+		type_stride -= b.value();
+		return *this;
+	}
+	__HOSTDEVICE__ tstride<type> operator +(const tstride<type> & b) const {
+		return tstride<type>(value() + b.value());
+	}
+
+	__HOSTDEVICE__ bool operator ==(const tstride<type> & b) const {
+		return type_stride == b.type_stride;
+	}
+
+	__HOSTDEVICE__ bool operator ==(int v) const {
+		return type_stride == v;
+	}
+public:
+	// conversions
+	template<typename type2>
+	__HOSTDEVICE__ void operator =(const tstride<type2> & b) {
+		type_stride = (b.type_stride * intsizeof(type2)) / intsizeof(type);
+	}
+	template<typename type2>
+	explicit __HOSTDEVICE__ tstride(const tstride<type2> & b) {
+		(*this) = b;
+	}
+};
+//! tstride arithmetics
+template<typename type>
+__HOSTDEVICE__ tstride<type> operator *(int x, tstride<type> s) {
+	return s *= x;
+}
+//! pointer arithmetics
+template<typename ptype, typename stype>
+__HOSTDEVICE__ ptype * __RESTRICT__ & operator +=(ptype * __RESTRICT__ & p, const tstride<stype> & s) {
+	return s.step_pointer(p);
+}
+
+template<typename ptype, typename stype>
+__HOSTDEVICE__ ptype * __RESTRICT__ operator +(ptype * __RESTRICT__ p, const tstride<stype> & s) {
+	ptype * P = p;
+	return s.step_pointer(P);
+}
+
+template<typename ptype, typename stype>
+__HOSTDEVICE__ ptype * __RESTRICT__ & operator -=(ptype * __RESTRICT__ & p, const tstride<stype> & s) {
+	return (-s).step_pointer(p);
+}
+
+template<typename ptype, typename stype>
+__HOSTDEVICE__ ptype * __RESTRICT__ operator -(ptype * __RESTRICT__ p, const tstride<stype> & s) {
+	ptype * P = p;
+	return (-s).step_pointer(P);
+}
+
+//_______________________________dslice_____________________________________________
+//! compact reference class, useful inside kernels
+/*
+ Consist of a pointer and strides - offsets in bytes to step the pointer in each dimension
+ strides are in bytes rather than in elements
+ - padding in bytes is more general than in elements
+ - saves a multiplication by sizeof(type) in address calculation (expensive 64 bit integr operation in GPU)
+ */
+template<typename type, int dims> struct dslice {
+protected:
+	type * _beg;  // first element
+	//__HOSTDEVICE__ char * beg_bytes() { return (char*)_beg; }
+	//__HOSTDEVICE__ char * beg_bytes() const { return (char*)_beg; }
+	intn<dims> _stride_bytes;	//!< offsets to next element along each dimension, In Bytes, can be negative
+public:
+	// strides access
+	//! stride along given dimension, as a safe proxy tstride<stype>
+	template<typename stype = char>
+	__HOSTDEVICE__ tstride<stype> stride(int d) const {
+		return tstride<stype>(_stride_bytes[d] / intsizeof(stype));
+	}
+	//! whole vector of strides, in bytes
+	__HOSTDEVICE__ const intn<dims> & stride_bytes() const {
+		return _stride_bytes;
+	}
+	//! whole vector of strides, in bytes
+	__HOSTDEVICE__ intn<dims> & stride_bytes() {
+		return _stride_bytes;
+	}
+	//! single stride in bytes
+	__HOSTDEVICE__ const int & stride_bytes(int d) const {
+		return _stride_bytes[d];
+	}
+	//! single stride in bytes
+	__HOSTDEVICE__ int & stride_bytes(int d) {
+		return _stride_bytes[d];
+	}
+public:
+	// stride access
+	//! get strides for linear memory - ascendin (first index fasterst) or descending order
+	template<bool order_ascending = true>
+	static __HOSTDEVICE__ intn<dims> linear_stride_bytes(const intn<dims> & size) {
+		return size.template prefix_prod_ex<order_ascending>() *= intsizeof(type);
+	}
+public:
+	// __________ constructors
+	dslice() = default;
+	//! default copy ctr
+	dslice(const dslice & b) = default;
+	//! default operator =
+	dslice& operator =(const dslice & b) = default;
+public:
+	//! construct from pointer and array of strides (count in bytes)
+	__HOSTDEVICE__ dslice(type * p, const intn<dims> & __stride_bytes) {
+		set_ref(p, __stride_bytes);
+	}
+	//! initialize from pointer and array of strides (count in bytes)
+	__HOSTDEVICE__ void set_ref(type * p, const intn<dims> & __stride_bytes) {
+		_beg = p;
+		_stride_bytes = __stride_bytes;
+	}
+public:
+	//! reinterpret as array of other base type (type2)
+	template<typename type2>
+	__HOSTDEVICE__ dslice<type2, dims> recast() const {
+		intn<dims> stb = _stride_bytes;
+		stb[0] = _stride_bytes[0] * intsizeof(type2) / intsizeof(type);
+		return dslice<type2, dims>((type2*) _beg, stb);
+	}
+public:
+	//____________ element access
+	__HOSTDEVICE__ type * __RESTRICT__ begin() const {
+		return _beg;
+	}
+	__HOSTDEVICE__ type & operator *() const {
+		return *begin();
+	}
+	__HOSTDEVICE__ type * __RESTRICT__ & ptr() {
+		return _beg;
+	}
+	__HOSTDEVICE__ type * __RESTRICT__  const & ptr() const {
+		return _beg;
+	}
+	__HOSTDEVICE__ type * __RESTRICT__ ptr(const intn<dims> & ii) const {
+		type * p = begin();
+		tstride<char> off = 0;
+		for (int d = 0; d < dims; ++d) {
+			off += ii[d] * stride<char>(d);
+		}
+		return p + off;
+	}
+
+	template<typename ...AA>
+	__HOSTDEVICE__ type * __RESTRICT__ ptr(AA ... aa) const {
+		return ptr(intn<dims>(aa...));
+	}
+
+	template<typename ...AA>
+	__HOSTDEVICE__ type & operator()(AA ... aa) const {
+		return *ptr(intn<dims>(aa...));
+	}
+	/*
+	 __HOSTDEVICE__ type * __RESTRICT__ ptr(int i0 = 0, int i1 = 0, int i2 = 0, int i3 = 0) const { // zero entries will be optimized out
+	 type * p = begin() + i0 * stride<char>(0);
+	 if (dims > 1){
+	 p += i1 * stride<char>(1);
+	 }
+	 if (dims > 2){
+	 p += i2 * stride<char>(2);
+	 }
+	 if (dims > 3){
+	 p += i3 * stride<char>(3);
+	 }
+	 return p;
+	 }
+	 __HOSTDEVICE__ type & operator ()(int i0 = 0, int i1 = 0, int i2 = 0, int i3 = 0) const {
+	 return *ptr(i0, i1, i2, i3);
+	 }
+	 */
+
+	__HOSTDEVICE__ type & operator ()(const intn<dims> & ii) const {
+		return *ptr(ii);
+	}
+
+public:
+	//___________offset and slice
+	//! offset to a position
+	__HOSTDEVICE__ dslice<type, dims> offset(const intn<dims> & ii) const {
+		dslice<type, dims> r;
+		r._beg = ptr(ii);
+		r._stride_bytes = _stride_bytes;
+		return r;
+	}
+	//
+	template<typename ... AA>
+	__HOSTDEVICE__ dslice<type, dims> offset(AA ... aa) const {
+		return offset(intn<dims>(aa...));
+	}
+	//! slice by fixing a specific dimension
+	template<int dim1 = 0>
+	__HOSTDEVICE__ dslice<type, dims - 1> subdim(int i_dim1) {
+		static_assert(dims > 1, "subndarray_ref of 1D is just pointer");
+		type * p = begin() + i_dim1 * stride(dim1);
+		int stride_bytes[dims - 1];
+		for (int d = 0; d < dims; ++d) {
+			if (d == dim1)
+				continue;
+			stride_bytes[d - (d > dim1)] = _stride_bytes[d];
+		}
+		return dslice<type, dims - 1>(p, stride_bytes);
+	}
+public:
+	//___________iterating over the array
+	//! increment a pointer along a given dimension
+	template<int dim>
+	__HOSTDEVICE__ void step_p_dim(type *& p, int step = 1) const {
+		p += stride<char>(dim) * step;
+	}
+	//! increment self along a given dimension
+	template<int dim>
+	__HOSTDEVICE__ void step_self_dim(int step = 1) {
+		_beg += stride<char>(dim) * step;
+	}
+	//! reverse the direction along a dimension
+	template<int dim = 0>
+	__HOSTDEVICE__ dslice<type, dims> & reverse_dim() {
+		_stride_bytes[dim] = -_stride_bytes[dim];
+		return *this;
+	}
+	//! conditional reverse the direction along a dimension
+	template<int dim = 0>
+	__HOSTDEVICE__ dslice<type, dims> & direction(int dir) {
+		if (dir < 0) {
+			return reverse_dim<dim>();
+		} else {
+			return *this;
+		};
+	}
+	//! permutes dims 0 and 1
+	__HOSTDEVICE__ dslice<type, dims> transp() const {
+		static_assert(dims == 2, "can only transpose 2D");
+		return dslice(_beg, _stride_bytes[1], _stride_bytes[0]);
+	}
+
+	//! permute other two dimensions
+	template<int dim1, int dim2>
+	__HOSTDEVICE__ dslice<type, dims> permute_dims() const {
+		dslice<type, dims> r(*this);
+		hd::swap(r._stride_bytes[dim1], r._stride_bytes[dim2]);
+		return r;
+	}
+};
+//____________________________shape______________________________________________________
+//! this is just a shorthand proxy class to commonly handle (size, strides)
+template<int n> class shapen {
+public:
+	intn<n> sz;
+	intn<n> stride_bytes;
+public:
+	__HOSTDEVICE__ shapen(const intn<n> & _size, const intn<n> & _stride_bytes) :
+			sz(_size), stride_bytes(_stride_bytes) {
+	}
+	__HOSTDEVICE__ int size(int i) const {
+		return sz[i];
+	}
+	__HOSTDEVICE__ const intn<n> & size() const {
+		return sz;
+	}
+	//! default copy constructor
+	//! default operator =
+};
+
+namespace kernel {
+template<typename type, int dims> class ndarray_ref;
+}
+
+template<typename type, int dims> class ndarray_ref;
+
+//template <typename type, int dims, typename tstream> tstream & operator << (tstream & ss, const ndarray_ref<type,dims> & a);
+
+namespace kernel {
+//_________________________kernel::ndarray_ref___________________________________________________
+//! kernel::ndarray_ref -- allowed to go to kernel
+template<typename type, int dims> class ndarray_ref: public dslice<type, dims> {
+private:
+	typedef dslice<type, dims> parent;
+public:
+	static constexpr int my_dims = dims;
+	typedef type my_type;
+	typedef intn<dims> my_index;
+public:
+	intn<dims> sz; //!< size in elements
+public:
+	// inherited stuff
+	using parent::begin;
+	using parent::ptr;
+	using parent::operator();
+	using parent::stride;
+	using parent::linear_stride_bytes;
+protected:
+	// inherited stuff for protected use
+	using parent::_beg;
+	using parent::_stride_bytes;
+public:
+	//constructors
+	//! uninitialized
+	ndarray_ref() = default;
+	//! default copy
+	ndarray_ref(const ndarray_ref<type, dims> & x) = default;
+	//! copy from a host ndarray_ref array (it is inherited, but the copy is a checking barrier)
+	__HOST__ ndarray_ref(const ::ndarray_ref<type, dims> & derived);
+	//! from a pointer
+	__HOSTDEVICE__ ndarray_ref(type * const __beg, const intn<dims> & size, const intn<dims> & stride_bytes) {
+		set_ref(__beg, size, stride_bytes);
+	}
+	//! copy from dslice
+	__HOSTDEVICE__ ndarray_ref(const ::dslice<type, dims> & x, const intn<dims> & size) :
+			parent(x), sz(size) {
+	}
+public:
+	//____________ initializers
+	//! copy =
+	ndarray_ref<type, dims> & operator =(const ndarray_ref<type, dims> & x) = default;
+	//! copy from derived (host-device barrier)
+	__HOST__ ndarray_ref<type, dims> & operator =(const ::ndarray_ref<type, dims> & x);
+	//! from a pointer and shape
+	__HOSTDEVICE__ ndarray_ref & set_ref(type * const __beg, const intn<dims> & size, const intn<dims> & stride_bytes) {
+		parent::set_ref(__beg, stride_bytes);
+		sz = size;
+		return *this;
+	}
+public:
+	//____________ size and shape
+	//! full size
+	__HOSTDEVICE__ const intn<dims> & size() const {
+		return sz;
+	}
+	//! full size
+	__HOSTDEVICE__ intn<dims> & size() {
+		return sz;
+	}
+	//! size along a dimension
+	__HOSTDEVICE__ int size(int dim) const {
+		return sz[dim];
+	}
+	//! size along a dimension
+	__HOSTDEVICE__ int & size(int dim) {
+		return sz[dim];
+	}
+	//! count the number of dimensions until the first zero size
+	int nz_dims() const {
+		for (int d = 0; d < dims; ++d) {
+			if (size(d) == 0)
+				return d; // hit first zero dimension
+		};
+		return dims;
+	}
+	//! check whether contiguous in memory
+	bool is_contiguous_rev() const {
+		return this->stride_bytes() == parent::template linear_stride_bytes<false>(this->size());
+	}
+	//! check last dimension contiguous
+	bool is_contiguous_last() const {
+		return this->stride_bytes()[dims - 1] == sizeof(type);
+	}
+public:
+	//! element type conversion
+	template<typename type2>
+	__HOSTDEVICE__ ndarray_ref<type2, dims> recast() const {
+		intn<dims> sz2 = sz;
+		sz2[0] = sz[0] * intsizeof(type) / intsizeof(type2); // new size along dim 0
+		return ndarray_ref<type2, dims>(parent::template recast<type2>(), sz2);
+	}
+public:
+	//____________ additional element access
+	/*
+	 __HOSTDEVICE__ type * __RESTRICT__ ptr(const intn<dims> & ii) const{
+	 return parent::ptr(ii);
+	 }
+	 __HOSTDEVICE__ type * __RESTRICT__ ptr(int i0, int i1 = 0, int i2 = 0, int i3 = 0) const { // zero entries will be optimized out
+	 return parent::ptr(i0,i1,i2,i3);
+	 }
+	 __HOSTDEVICE__ type & operator ()(int i0, int i1 = 0, int i2 = 0, int i3 = 0) const {
+	 return *ptr(i0, i1, i2, i3);
+	 }
+	 __HOSTDEVICE__ type & operator ()(const intn<dims> & ii) const {
+	 return *ptr(ii);
+	 }
+	 */
+	__HOSTDEVICE__ type & operator [](const intn<dims> & ii) const {
+		return *ptr(ii);
+	}
+public:
+	//____________ slicing
+	//! slice by fixing one dimension
+	template<int dim1 = 0> // default is to fix the first dimension
+	__HOSTDEVICE__ ndarray_ref<type, dims - 1> subdim(int i_dim1) const {
+		static_assert(dim1 >= 0 && dim1 < dims, "bad");
+		static_assert(dims > 1, "1-subdim requires dimension 2 or bigger");
+		int size[dims - 1];
+		int strideb[dims - 1];
+		int k = 0;
+		type * p = ptr();
+		for (int i = 0; i < dims; ++i) {
+			if (i == dim1) { // fixed dimension
+				p += stride(dim1) * i_dim1;
+				continue;
+			}
+			size[k] = this->size(i);
+			strideb[k] = _stride_bytes[i];
+			++k;
+		}
+		ndarray_ref<type, dims - 1> r(p, size, strideb);
+		return r;
+	}
+	//! ndarray_ref by fixing two dimensions
+	template<int dim1, int dim2>
+	__HOSTDEVICE__ ndarray_ref<type, dims - 2> subdim(int i_dim1, int i_dim2) const {
+		static_assert(dims > 2, "2-subdim requires dimension 3 or bigger");
+		static_assert(dim1 >= 0 && dim1 < dims,"bad");
+		static_assert(dim2 >= 0 && dim2 < dims,"bad");
+		static_assert(dim1 != dim2,"bad");
+		intn<dims - 2> size;
+		intn<dims - 2> strideb;
+		type * p = ptr();
+		int k = 0;
+		for (int i = 0; i < dims; ++i) {
+			if (i == dim1) {
+				p += stride(dim1) * i_dim1;
+				continue;
+			}
+			if (i == dim2) {
+				p += stride(dim2) * i_dim2;
+				continue;
+			}
+			size[k] = this->size(i);
+			strideb[k] = _stride_bytes[i];
+			++k;
+		}
+		return ndarray_ref<type, dims - 2>(p, size, strideb);
+	}
+	//! size of the memory support in bytes
+	__HOSTDEVICE__ size_t size_bytes()const{
+		int d = this->stride_bytes().max_idx();
+		return size_t(size(d)) * this->stride_bytes(d);
+	}
+};
+}
+
+/*
+ template <typename Kernel, typename... Args> void launch(dim3 dimBlock, dim3 dimGrid, Kernel kernel, Args... args){
+ kernel <<< dimGrid, dimBlock >>>(args...);
+ }
+ */
+
+//__CUDA_ARCH__is always undefined when compiling host code, steered by nvcc or not
+//__CUDA_ARCH__is only defined for the device code trajectory of compilation steered by nvcc
